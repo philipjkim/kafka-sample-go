@@ -6,21 +6,23 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/Shopify/sarama"
 	"github.com/philipjkim/kafka-brokers-go"
+	"github.com/wvanbergen/kafka/consumergroup"
+)
+
+const (
+	defaultKafkaTopic    = "test_topic"
+	defaultConsumerGroup = "defaultConsumerGroup"
 )
 
 var (
-	zkServers  = flag.String("zk", os.Getenv("ZK_SERVERS"), "The comma-separated list of ZooKeeper servers. You can skip this flag by setting ZK_SERVERS environment variable")
-	topic      = flag.String("topic", "", "REQUIRED: the topic to consume")
-	partitions = flag.String("partitions", "all", "The partitions to consume, can be 'all' or comma-separated numbers")
-	offset     = flag.String("offset", "newest", "The offset to start with. Can be `oldest`, `newest`")
-	verbose    = flag.Bool("verbose", false, "Whether to turn on sarama logging")
-	bufferSize = flag.Int("buffer-size", 256, "The buffer size of the message channel.")
+	zkServers     = flag.String("zk", os.Getenv("ZK_SERVERS"), "The comma-separated list of ZooKeeper servers. You can skip this flag by setting ZK_SERVERS environment variable")
+	topic         = flag.String("topic", defaultKafkaTopic, "The topic to consume")
+	consumerGroup = flag.String("group", defaultConsumerGroup, "The name of the consumer group, used for coordination and load balancing")
 
 	logger = log.New(os.Stderr, "", log.LstdFlags)
 )
@@ -29,129 +31,75 @@ func main() {
 	flag.Parse()
 
 	if *zkServers == "" {
-		printUsageErrorAndExit("no -zk specified. Alternatively, set the ZK_SERVERS environment variable")
+		log.Fatalln("no -zk specified. Alternatively, set the ZK_SERVERS environment variable")
 	}
 
-	conn, err := kb.NewConn(strings.Split(*zkServers, ","))
+	zkNodes := strings.Split(*zkServers, ",")
+	conn, err := kb.NewConn(zkNodes)
 	if err != nil {
-		printErrorAndExit(69, "Failed to create connection to zk: %s", err)
+		log.Fatalln(err)
 	}
 	defer conn.Close()
 	brokerList, _, err := conn.GetW()
 	if err != nil {
-		printErrorAndExit(69, "Failed to get broker list from zk: %s", err)
+		log.Fatalln(err)
 	}
 	fmt.Printf("brokerList: %q\n", brokerList)
 
-	if *topic == "" {
-		printUsageErrorAndExit("-topic is required")
+	config := consumergroup.NewConfig()
+	config.Offsets.Initial = sarama.OffsetNewest
+	config.Offsets.ProcessingTimeout = 10 * time.Second
+
+	consumer, consumerErr := consumergroup.JoinConsumerGroup(*consumerGroup,
+		[]string{*topic}, zkNodes, config)
+	if consumerErr != nil {
+		log.Fatalln(consumerErr)
 	}
 
-	if *verbose {
-		sarama.Logger = logger
-	}
-
-	var initialOffset int64
-	switch *offset {
-	case "oldest":
-		initialOffset = sarama.OffsetOldest
-	case "newest":
-		initialOffset = sarama.OffsetNewest
-	default:
-		printUsageErrorAndExit("-offset should be `oldest` or `newest`")
-	}
-
-	c, err := sarama.NewConsumer(brokerList, nil)
-	if err != nil {
-		printErrorAndExit(69, "Failed to start consumer: %s", err)
-	}
-
-	partitionList, err := getPartitions(c)
-	if err != nil {
-		printErrorAndExit(69, "Failed to get the list of partitions: %s", err)
-	}
-
-	var (
-		messages = make(chan *sarama.ConsumerMessage, *bufferSize)
-		closing  = make(chan struct{})
-		wg       sync.WaitGroup
-	)
-
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
 	go func() {
-		signals := make(chan os.Signal, 1)
-		signal.Notify(signals, os.Kill, os.Interrupt)
-		<-signals
-		logger.Println("Initiating shutdown of consumer...")
-		close(closing)
-	}()
-
-	for _, partition := range partitionList {
-		pc, err := c.ConsumePartition(*topic, partition, initialOffset)
-		if err != nil {
-			printErrorAndExit(69, "Failed to start consumer for partition %d: %s", partition, err)
-		}
-
-		go func(pc sarama.PartitionConsumer) {
-			<-closing
-			pc.AsyncClose()
-		}(pc)
-
-		wg.Add(1)
-		go func(pc sarama.PartitionConsumer) {
-			defer wg.Done()
-			for message := range pc.Messages() {
-				messages <- message
-			}
-		}(pc)
-	}
-
-	go func() {
-		for msg := range messages {
-			fmt.Printf("Partition:\t%d\n", msg.Partition)
-			fmt.Printf("Offset:\t%d\n", msg.Offset)
-			fmt.Printf("Key:\t%s\n", string(msg.Key))
-			fmt.Printf("Value:\t%s\n", string(msg.Value))
-			fmt.Println()
+		<-c
+		if err := consumer.Close(); err != nil {
+			sarama.Logger.Println("Error closing the consumer", err)
 		}
 	}()
 
-	wg.Wait()
-	logger.Println("Done consuming topic", *topic)
-	close(messages)
-
-	if err := c.Close(); err != nil {
-		logger.Println("Failed to close consumer: ", err)
-	}
-}
-
-func getPartitions(c sarama.Consumer) ([]int32, error) {
-	if *partitions == "all" {
-		return c.Partitions(*topic)
-	}
-
-	tmp := strings.Split(*partitions, ",")
-	var pList []int32
-	for i := range tmp {
-		val, err := strconv.ParseInt(tmp[i], 10, 32)
-		if err != nil {
-			return nil, err
+	go func() {
+		for err := range consumer.Errors() {
+			log.Println(err)
 		}
-		pList = append(pList, int32(val))
+	}()
+
+	eventCount := 0
+	offsets := make(map[string]map[int32]int64)
+
+	for message := range consumer.Messages() {
+		if offsets[message.Topic] == nil {
+			offsets[message.Topic] = make(map[int32]int64)
+		}
+
+		eventCount++
+		if offsets[message.Topic][message.Partition] != 0 &&
+			offsets[message.Topic][message.Partition] != message.Offset-1 {
+			log.Printf(
+				"Unexpected offset on %s:%d. Expected %d, found %d, diff %d.\n",
+				message.Topic,
+				message.Partition,
+				offsets[message.Topic][message.Partition]+1,
+				message.Offset,
+				message.Offset-offsets[message.Topic][message.Partition]+1)
+		}
+
+		log.Printf("partition: %d, offset: %d, key: %s, value: %s",
+			message.Partition, message.Offset, message.Key, message.Value)
+
+		time.Sleep(10 * time.Millisecond)
+
+		offsets[message.Topic][message.Partition] = message.Offset
+		consumer.CommitUpto(message)
 	}
 
-	return pList, nil
-}
-
-func printErrorAndExit(code int, format string, values ...interface{}) {
-	fmt.Fprintf(os.Stderr, "ERROR: %s\n", fmt.Sprintf(format, values...))
-	fmt.Fprintln(os.Stderr)
-	os.Exit(code)
-}
-
-func printUsageErrorAndExit(format string, values ...interface{}) {
-	fmt.Fprintf(os.Stderr, "ERROR: %s\n", fmt.Sprintf(format, values...))
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "Available command line options:")
-	flag.PrintDefaults()
-	os.Exit(64)
+	log.Printf("Processed %d events", eventCount)
+	log.Printf("%+v", offsets)
 }

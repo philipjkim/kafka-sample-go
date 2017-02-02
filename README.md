@@ -26,9 +26,14 @@ If you want to scale Kafka brokers to 4:
     cd sub
     go run sub.go -topic=t1 -zk=192.168.99.100:2181
 
+For consuming as in another consumer group:
+
+    go run sub.go -topic=t1 -zk=192.168.99.100:2181 -group=group02
+
 
 ## References
 
 - https://github.com/wurstmeister/kafka-docker
 - https://github.com/Shopify/sarama
 - https://github.com/wvanbergen/kazoo-go
+- https://github.com/wvanbergen/kafka
